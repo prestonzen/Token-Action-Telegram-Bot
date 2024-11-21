@@ -40,6 +40,13 @@ last_signature = None
 # Token list cache
 token_list = None
 
+# Known exchange program IDs
+EXCHANGE_PROGRAM_IDS = {
+    'Serum DEX': '9xQeWvG816bUx9EPuJ9p6gNZQY39Yod89VLvT93mC8Ln',
+    'Raydium Swap': 'RVKd61ztZW9jzWz6pL9dp25o7FH5DVV7PQQ3hqRvnkW',
+    # Add other known program IDs as needed
+}
+
 async def get_token_name_from_mint(mint_address):
     global token_list
     if token_list is None:
@@ -65,15 +72,24 @@ async def get_token_name_from_mint(mint_address):
     # Search for the token in the token list
     for token in token_list:
         if token.get('address') == mint_address:
-            symbol = token.get('symbol', mint_address)
+            symbol = token.get('symbol', None)
+            name = token.get('name', None)
             print(f"Found token symbol '{symbol}' for mint address {mint_address}.")
-            return symbol
-    # If not found, return mint address
-    print(f"Token symbol not found for mint address {mint_address}. Using mint address as token name.")
-    return mint_address
+            return symbol or name or None
+    # If not found, return None
+    print(f"Token symbol not found for mint address {mint_address}.")
+    return None
+
+def is_purchase_transaction(instructions):
+    for instr in instructions:
+        program_id = instr.get('programId')
+        if program_id in EXCHANGE_PROGRAM_IDS.values():
+            print(f"Transaction involves known exchange program: {program_id}")
+            return True
+    return False
 
 async def send_keep_alive_message(bot):
-    message = f"🔥 {wallet_nickname} Tracker Bot is active! 🔥"
+    message = f"🔥 Kaizen Crypto Wallet Tracker Bot is active! 🔥"
     await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=message)
     print("Sent keep-alive message.")
 
@@ -158,6 +174,11 @@ async def monitor_wallet(wallet, client, bot):
             txn_time = 'Unknown time'
         print(f"Transaction time: {txn_time}")
 
+        # Extract transaction instructions
+        transaction_message = txn_dict.get('transaction', {}).get('message', {})
+        instructions = transaction_message.get('instructions', [])
+        is_purchase = is_purchase_transaction(instructions)
+
         # Detect changes in balances
         for (owner, mint), amounts in balances.items():
             pre_amount = amounts.get('pre', 0)
@@ -167,15 +188,31 @@ async def monitor_wallet(wallet, client, bot):
             print(f"Owner: {owner}, Mint: {mint}, Pre-Amount: {pre_amount}, Post-Amount: {post_amount}, Delta: {delta}")
 
             if delta != 0 and owner == wallet_address_lower:
-                action = 'bought' if delta > 0 else 'sold'
+                if delta > 0:
+                    if is_purchase:
+                        action = 'bought'
+                    else:
+                        action = 'received'
+                else:
+                    if is_purchase:
+                        action = 'sold'
+                    else:
+                        action = 'sent'
+
                 token_name = await get_token_name_from_mint(mint)
                 amount = abs(delta)
+                # Construct URLs
                 dexscreener_url = f"https://dexscreener.com/solana/{mint}"
+                solscan_token_url = f"https://solscan.io/token/{mint}"
+                # Use "this token" as per your request
+                token_display_name = token_name if token_name else "this token"
+                # Prepare the message with the requested format
                 message = (
-                    f"🔥🚀 {wallet_nickname} Tracker Bot Alert! 🚀🔥\n\n"
-                    f"{wallet_nickname} {action} {amount} of {token_name} with the contract address of:\n"
+                    f"🔥🚀 Kaizen Crypto Wallet Tracker Bot Alert! 🚀🔥\n\n"
+                    f"{wallet_nickname} {action} {amount} of [{token_display_name}]({solscan_token_url}) with the contract address of:\n"
                     f"📝 {mint} 📝\n"
                     f"At {txn_time} 🕒\n\n"
+                    f"🔗 [View on Solscan]({solscan_token_url})\n"
                     f"🔗 [View on Dexscreener]({dexscreener_url})\n"
                     f"💰💎📈"
                 )
