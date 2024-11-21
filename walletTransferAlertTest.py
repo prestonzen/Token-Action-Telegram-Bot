@@ -5,9 +5,11 @@ import json
 import traceback
 from dotenv import load_dotenv
 from solana.rpc.async_api import AsyncClient
-from solders.pubkey import Pubkey
+from solana.rpc.types import TokenAccountOpts
+from solders.pubkey import Pubkey  # Use solders.Pubkey
 from telegram import Bot
 import aiohttp
+import base64
 
 # Load environment variables from .env file
 load_dotenv()
@@ -40,12 +42,9 @@ last_signature = None
 # Token list cache
 token_list = None
 
-# Known exchange program IDs
-EXCHANGE_PROGRAM_IDS = {
-    'Serum DEX': '9xQeWvG816bUx9EPuJ9p6gNZQY39Yod89VLvT93mC8Ln',
-    'Raydium Swap': 'RVKd61ztZW9jzWz6pL9dp25o7FH5DVV7PQQ3hqRvnkW',
-    # Add other known program IDs as needed
-}
+# Token Program ID
+TOKEN_PROGRAM_ID_STR = 'TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA'
+TOKEN_PROGRAM_ID = Pubkey.from_string(TOKEN_PROGRAM_ID_STR)
 
 async def get_token_name_from_mint(mint_address):
     global token_list
@@ -79,14 +78,6 @@ async def get_token_name_from_mint(mint_address):
     # If not found, return None
     print(f"Token symbol not found for mint address {mint_address}.")
     return None
-
-def is_purchase_transaction(instructions):
-    for instr in instructions:
-        program_id = instr.get('programId')
-        if program_id in EXCHANGE_PROGRAM_IDS.values():
-            print(f"Transaction involves known exchange program: {program_id}")
-            return True
-    return False
 
 async def send_keep_alive_message(bot):
     message = f"🔥 Kaizen Crypto Wallet Tracker Bot is active! 🔥"
@@ -133,39 +124,6 @@ async def monitor_wallet(wallet, client, bot):
             print("Transaction metadata not found.")
             return
 
-        pre_balances = meta.get('preTokenBalances', [])
-        post_balances = meta.get('postTokenBalances', [])
-        print(f"Pre-token balances: {pre_balances}")
-        print(f"Post-token balances: {post_balances}")
-
-        # Map account indices to public keys
-        account_keys = [key.get('pubkey') for key in txn_dict.get('transaction', {}).get('message', {}).get('accountKeys', [])]
-        print(f"Account keys: {account_keys}")
-
-        balances = {}
-        for balance in pre_balances + post_balances:
-            idx = balance.get('accountIndex')
-            if idx is None or idx >= len(account_keys):
-                print(f"Invalid account index {idx}. Skipping balance entry.")
-                continue  # Skip if index is invalid
-
-            owner = balance.get('owner')
-            if owner is None:
-                owner = account_keys[idx]
-
-            owner = str(owner).strip().lower()
-            mint = balance.get('mint')
-            amount_info = balance.get('uiTokenAmount')
-            amount_str = amount_info.get('uiAmountString') if amount_info else None
-            amount = float(amount_str) if amount_str is not None else 0
-            key = (owner, mint)
-            if balance in pre_balances:
-                balances.setdefault(key, {})['pre'] = amount
-            else:
-                balances.setdefault(key, {})['post'] = amount
-
-            print(f"Processed balance entry: Owner={owner}, Mint={mint}, Amount={amount}")
-
         # Get transaction timestamp
         block_time = txn_dict.get('blockTime')
         if block_time:
@@ -174,53 +132,128 @@ async def monitor_wallet(wallet, client, bot):
             txn_time = 'Unknown time'
         print(f"Transaction time: {txn_time}")
 
-        # Extract transaction instructions
+        # Extract transaction message and instructions
         transaction_message = txn_dict.get('transaction', {}).get('message', {})
         instructions = transaction_message.get('instructions', [])
-        is_purchase = is_purchase_transaction(instructions)
+        account_keys = transaction_message.get('accountKeys', [])
+        print(f"Account keys: {account_keys}")
 
-        # Detect changes in balances
-        for (owner, mint), amounts in balances.items():
-            pre_amount = amounts.get('pre', 0)
-            post_amount = amounts.get('post', 0)
-            delta = post_amount - pre_amount
+        # Map account indices to public keys
+        idx_to_pubkey = [key.get('pubkey') for key in account_keys]
 
-            print(f"Owner: {owner}, Mint: {mint}, Pre-Amount: {pre_amount}, Post-Amount: {post_amount}, Delta: {delta}")
+        # Fetch token accounts owned by the wallet
+        opts = TokenAccountOpts(program_id=TOKEN_PROGRAM_ID)
+        response = await client.get_token_accounts_by_owner(wallet, opts)
+        owned_token_accounts = set()
+        token_account_to_mint = {}
+        if response.value:
+            for account_info in response.value:
+                token_account_pubkey = str(account_info.pubkey)
+                owned_token_accounts.add(token_account_pubkey)
+                # Decode account data
+                account_data_base64 = account_info.account.data[0]
+                account_data_bytes = base64.b64decode(account_data_base64)
+                # Parse the account data to get the mint address
+                if len(account_data_bytes) >= 64:
+                    mint_pubkey_bytes = account_data_bytes[0:32]
+                    mint_address = str(Pubkey.from_bytes(mint_pubkey_bytes))
+                    token_account_to_mint[token_account_pubkey] = mint_address
 
-            if delta != 0 and owner == wallet_address_lower:
-                if delta > 0:
-                    if is_purchase:
-                        action = 'bought'
-                    else:
-                        action = 'received'
+        print(f"Owned token accounts: {owned_token_accounts}")
+
+        # Process each instruction to find token transfers involving the wallet
+        for instr in instructions:
+            program_id = instr.get('programId')
+            if program_id != TOKEN_PROGRAM_ID_STR:
+                continue  # Skip if not the Token Program
+
+            print(f"Processing Token Program instruction: {instr}")
+
+            # Get the instruction data and decode it
+            data_base64 = instr.get('data')
+            data_bytes = base64.b64decode(data_base64)
+            instruction_code = data_bytes[0]
+
+            # Check if it's a Transfer or TransferChecked instruction
+            if instruction_code in (3, 12):  # 3: Transfer, 12: TransferChecked
+                accounts = instr.get('accounts')
+                if len(accounts) < 2:
+                    continue  # Not enough accounts, skip
+
+                source_idx = accounts[0]
+                dest_idx = accounts[1]
+
+                source_account = idx_to_pubkey[source_idx]
+                dest_account = idx_to_pubkey[dest_idx]
+
+                print(f"Transfer from {source_account} to {dest_account}")
+
+                # Check if the source or destination account is owned by the wallet
+                is_source_owned = source_account in owned_token_accounts
+                is_dest_owned = dest_account in owned_token_accounts
+
+                if not (is_source_owned or is_dest_owned):
+                    continue  # Neither account is owned by the wallet
+
+                # Get the mint address
+                mint = None
+                if is_source_owned:
+                    mint = token_account_to_mint.get(source_account)
+                if is_dest_owned and not mint:
+                    mint = token_account_to_mint.get(dest_account)
+
+                if not mint:
+                    print(f"Mint address not found for accounts {source_account} or {dest_account}")
+                    continue
+
+                # Amount is encoded in data bytes
+                # For TransferChecked (12), amount is at bytes 1-9 (8 bytes)
+                # For Transfer (3), amount is at bytes 1-9 (8 bytes)
+                if len(data_bytes) >= 9:
+                    amount_bytes = data_bytes[1:9]
+                    amount = int.from_bytes(amount_bytes, "little")
+                    # Get decimals for the token to compute ui amount
+                    token_name = await get_token_name_from_mint(mint)
+                    decimals = 0
+                    for token in token_list:
+                        if token.get('address') == mint:
+                            decimals = token.get('decimals', 0)
+                            break
+                    ui_amount = amount / (10 ** decimals)
                 else:
-                    if is_purchase:
-                        action = 'sold'
-                    else:
-                        action = 'sent'
+                    print("Amount not found in instruction data.")
+                    continue
 
-                token_name = await get_token_name_from_mint(mint)
-                amount = abs(delta)
+                # Determine action
+                if is_source_owned and not is_dest_owned:
+                    action = 'sent'
+                elif is_dest_owned and not is_source_owned:
+                    action = 'received'
+                elif is_source_owned and is_dest_owned:
+                    action = 'transferred within own accounts'
+                    continue  # Ignore transfers within own accounts
+                else:
+                    continue  # Should not happen
+
+                token_display_name = token_name if token_name else "this token"
+
                 # Construct URLs
                 dexscreener_url = f"https://dexscreener.com/solana/{mint}"
                 solscan_token_url = f"https://solscan.io/token/{mint}"
-                # Use "this token" as per your request
-                token_display_name = token_name if token_name else "this token"
+
                 # Prepare the message with the requested format
                 message = (
                     f"🔥🚀 Kaizen Crypto Wallet Tracker Bot Alert! 🚀🔥\n\n"
-                    f"{wallet_nickname} {action} {amount} of [{token_display_name}]({solscan_token_url}) with the contract address of:\n"
+                    f"{wallet_nickname} {action} {ui_amount} of [{token_display_name}]({solscan_token_url}) with the contract address of:\n"
                     f"📝 {mint} 📝\n"
                     f"At {txn_time} 🕒\n\n"
-                    f"🔗 [View on Solscan]({solscan_token_url})\n"
+                    f"🔗 [View on Solscan](https://solscan.io/tx/{latest_signature})\n"
                     f"🔗 [View on Dexscreener]({dexscreener_url})\n"
                     f"💰💎📈"
                 )
                 await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=message, parse_mode='Markdown')
                 print("Sent transaction alert message.")
-                break  # Only process the first relevant change
-            else:
-                print(f"Owner {owner} does not match the monitored wallet {wallet_address_lower} or delta is zero.")
+                break  # Only process the first relevant transfer
 
         # Update the last processed signature
         last_signature = latest_signature

@@ -3,3 +3,4 @@ solana>=0.25.0
 solders
 python-dotenv 
 telegram
+aiohttp
