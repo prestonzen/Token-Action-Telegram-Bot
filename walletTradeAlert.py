@@ -27,10 +27,6 @@ except ValueError as e:
     print(f"Invalid wallet address: {e}")
     exit(1)
 
-# Initialize Solana client and Telegram bot
-client = AsyncClient(SOLANA_RPC_URL)
-bot = Bot(token=TELEGRAM_BOT_TOKEN)
-
 # Keep track of last processed signature
 last_signature = None
 
@@ -42,12 +38,12 @@ def get_token_name_from_mint(mint_address):
     # For simplicity, we'll return the mint address itself
     return mint_address
 
-async def send_keep_alive_message():
+async def send_keep_alive_message(bot):
     wallet_str = str(WATCH_WALLET)
     message = f"Keep-alive: Monitoring wallet {wallet_str}"
     await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=message)
 
-async def monitor_wallet(wallet, initial_run=False):
+async def monitor_wallet(wallet, client, bot, initial_run=False):
     global last_signature
 
     # Get recent transaction signatures
@@ -108,7 +104,8 @@ async def monitor_wallet(wallet, initial_run=False):
             owner = balance.get('owner') or account_keys[idx]
             mint = balance['mint']
             amount_info = balance['uiTokenAmount']
-            amount = float(amount_info['uiAmountString']) if amount_info['uiAmountString'] is not None else 0
+            amount_str = amount_info.get('uiAmountString') if amount_info else None
+            amount = float(amount_str) if amount_str is not None else 0
             key = (owner, mint)
             if balance in pre_balances:
                 balances.setdefault(key, {})['pre'] = amount
@@ -134,22 +131,26 @@ async def monitor_wallet(wallet, initial_run=False):
 async def main():
     global last_keep_alive
     initial_run = True
-    while True:
-        try:
-            await monitor_wallet(WATCH_WALLET, initial_run)
-            initial_run = False
-        except Exception as e:
-            print(f"Error monitoring wallet {WATCH_WALLET}: {e}")
 
-        # Check if it's time to send a keep-alive message (every hour)
-        current_time = datetime.utcnow()
-        if current_time - last_keep_alive >= timedelta(hours=1):
-            await send_keep_alive_message()
-            last_keep_alive = current_time
+    # Initialize Solana client and Telegram bot within the async context
+    async with AsyncClient(SOLANA_RPC_URL) as client, Bot(token=TELEGRAM_BOT_TOKEN) as bot:
+        # Send initial keep-alive message
+        await send_keep_alive_message(bot)
 
-        await asyncio.sleep(60)
+        while True:
+            try:
+                await monitor_wallet(WATCH_WALLET, client, bot, initial_run)
+                initial_run = False
+            except Exception as e:
+                print(f"Error monitoring wallet {WATCH_WALLET}: {e}")
+
+            # Check if it's time to send a keep-alive message (every hour)
+            current_time = datetime.utcnow()
+            if current_time - last_keep_alive >= timedelta(hours=1):
+                await send_keep_alive_message(bot)
+                last_keep_alive = current_time
+
+            await asyncio.sleep(60)
 
 if __name__ == "__main__":
-    # Send initial keep-alive message
-    asyncio.run(send_keep_alive_message())
     asyncio.run(main())
