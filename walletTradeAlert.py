@@ -1,7 +1,9 @@
 import os
-import time
+from datetime import datetime, timedelta
+import asyncio
+import json  # Import json to parse JSON strings
 from dotenv import load_dotenv
-from solana.rpc.api import Client
+from solana.rpc.async_api import AsyncClient  # Use AsyncClient for async operations
 from solders.pubkey import Pubkey
 from telegram import Bot
 
@@ -12,7 +14,6 @@ load_dotenv()
 TELEGRAM_BOT_TOKEN = os.getenv('Kaizen_Apps_Telegram_Token')
 TELEGRAM_CHAT_ID = os.getenv('Kaizen_Telegram_group_ID')
 SOLANA_RPC_URL = os.getenv('SOLANA_RPC_URL', 'https://api.mainnet-beta.solana.com')
-PRICE_PER_TOKEN_USD = float(os.getenv('PRICE_PER_TOKEN_USD', '1'))
 
 # Get the wallet address and convert it to a Pubkey object
 wallet_address = os.getenv('Watch_Wallet_1')
@@ -27,22 +28,30 @@ except ValueError as e:
     exit(1)
 
 # Initialize Solana client and Telegram bot
-client = Client(SOLANA_RPC_URL)
+client = AsyncClient(SOLANA_RPC_URL)
 bot = Bot(token=TELEGRAM_BOT_TOKEN)
 
 # Keep track of last processed signature
 last_signature = None
+
+# Keep-alive message timer
+last_keep_alive = datetime.utcnow()
 
 def get_token_name_from_mint(mint_address):
     # Implement a mapping or API call to get the token name from mint address
     # For simplicity, we'll return the mint address itself
     return mint_address
 
-def monitor_wallet(wallet):
+async def send_keep_alive_message():
+    wallet_str = str(WATCH_WALLET)
+    message = f"Keep-alive: Monitoring wallet {wallet_str}"
+    await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=message)
+
+async def monitor_wallet(wallet, initial_run=False):
     global last_signature
 
     # Get recent transaction signatures
-    response = client.get_signatures_for_address(wallet, limit=10)
+    response = await client.get_signatures_for_address(wallet, limit=10)
     if response.value is None:
         return
 
@@ -50,48 +59,56 @@ def monitor_wallet(wallet):
     if not signatures:
         return
 
-    latest_signature = signatures[0].signature
     wallet_str = str(wallet)
 
-    if last_signature is None:
-        last_signature = latest_signature
-        return  # Skip processing on the first run
+    # On initial run, process the latest 5 transactions
+    if initial_run:
+        new_signatures = [sig_info.signature for sig_info in signatures[:5]]
+    else:
+        latest_signature = signatures[0].signature
 
-    # Find new signatures since the last processed one
-    new_signatures = []
-    for sig_info in signatures:
-        if sig_info.signature == last_signature:
-            break
-        new_signatures.append(sig_info.signature)
+        if last_signature is None:
+            last_signature = latest_signature
+            return  # Skip processing on the first regular run
 
-    if not new_signatures:
-        return
+        # Find new signatures since the last processed one
+        new_signatures = []
+        for sig_info in signatures:
+            if sig_info.signature == last_signature:
+                break
+            new_signatures.append(sig_info.signature)
+
+        if not new_signatures:
+            return
 
     # Process new transactions
     for sig in reversed(new_signatures):
-        txn_resp = client.get_transaction(sig, encoding='jsonParsed')
+        txn_resp = await client.get_transaction(sig, encoding='jsonParsed')
         if txn_resp.value is None:
             continue
 
         txn = txn_resp.value
-        meta = txn.meta
+        # Convert transaction to JSON string and then to dictionary
+        txn_json = txn.to_json()
+        txn_dict = json.loads(txn_json)
+        meta = txn_dict.get('meta')
         if meta is None:
             continue
 
-        pre_balances = meta.pre_token_balances or []
-        post_balances = meta.post_token_balances or []
+        pre_balances = meta.get('preTokenBalances', [])
+        post_balances = meta.get('postTokenBalances', [])
 
         # Map account indices to public keys
-        account_keys = [str(key.pubkey) for key in txn.transaction.message.account_keys]
+        account_keys = [key.get('pubkey') for key in txn_dict['transaction']['message']['accountKeys']]
 
         # Build balances before and after the transaction
         balances = {}
         for balance in pre_balances + post_balances:
-            idx = balance.account_index
-            owner = balance.owner or account_keys[idx]
-            mint = balance.mint
-            amount_info = balance.ui_token_amount
-            amount = float(amount_info.ui_amount_string) if amount_info.ui_amount_string is not None else 0
+            idx = balance['accountIndex']
+            owner = balance.get('owner') or account_keys[idx]
+            mint = balance['mint']
+            amount_info = balance['uiTokenAmount']
+            amount = float(amount_info['uiAmountString']) if amount_info['uiAmountString'] is not None else 0
             key = (owner, mint)
             if balance in pre_balances:
                 balances.setdefault(key, {})['pre'] = amount
@@ -108,18 +125,31 @@ def monitor_wallet(wallet):
                 token_name = get_token_name_from_mint(mint)
                 amount = abs(delta)
                 message = f"Wallet {wallet_str} {action} {amount} of {token_name}."
-                bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=message)
+                await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=message)
 
     # Update the last processed signature
-    last_signature = latest_signature
+    if not initial_run and signatures:
+        last_signature = signatures[0].signature
 
-def main():
+async def main():
+    global last_keep_alive
+    initial_run = True
     while True:
         try:
-            monitor_wallet(WATCH_WALLET)
+            await monitor_wallet(WATCH_WALLET, initial_run)
+            initial_run = False
         except Exception as e:
             print(f"Error monitoring wallet {WATCH_WALLET}: {e}")
-        time.sleep(60)
+
+        # Check if it's time to send a keep-alive message (every hour)
+        current_time = datetime.utcnow()
+        if current_time - last_keep_alive >= timedelta(hours=1):
+            await send_keep_alive_message()
+            last_keep_alive = current_time
+
+        await asyncio.sleep(60)
 
 if __name__ == "__main__":
-    main()
+    # Send initial keep-alive message
+    asyncio.run(send_keep_alive_message())
+    asyncio.run(main())
