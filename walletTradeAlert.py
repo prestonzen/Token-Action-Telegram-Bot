@@ -1,11 +1,13 @@
 import os
-from datetime import datetime, timedelta
+from datetime import datetime, timezone
 import asyncio
-import json  # Import json to parse JSON strings
+import json
+import traceback
 from dotenv import load_dotenv
-from solana.rpc.async_api import AsyncClient  # Use AsyncClient for async operations
+from solana.rpc.async_api import AsyncClient
 from solders.pubkey import Pubkey
 from telegram import Bot
+import aiohttp
 
 # Load environment variables from .env file
 load_dotenv()
@@ -15,8 +17,10 @@ TELEGRAM_BOT_TOKEN = os.getenv('Kaizen_Apps_Telegram_Token')
 TELEGRAM_CHAT_ID = os.getenv('Kaizen_Telegram_group_ID')
 SOLANA_RPC_URL = os.getenv('SOLANA_RPC_URL', 'https://api.mainnet-beta.solana.com')
 
-# Get the wallet address and convert it to a Pubkey object
+# Get the wallet address and nickname from the .env file
 wallet_address = os.getenv('Watch_Wallet_1')
+wallet_nickname = os.getenv('Watch_Wallet_1_Nickname', 'Wallet')
+
 if not wallet_address:
     print("No wallet address provided in the .env file.")
     exit(1)
@@ -30,58 +34,56 @@ except ValueError as e:
 # Keep track of last processed signature
 last_signature = None
 
-# Keep-alive message timer
-last_keep_alive = datetime.utcnow()
+# Token list cache
+token_list = None
 
-def get_token_name_from_mint(mint_address):
-    # Implement a mapping or API call to get the token name from mint address
-    # For simplicity, we'll return the mint address itself
+async def get_token_name_from_mint(mint_address):
+    global token_list
+    if token_list is None:
+        # Fetch the token list
+        url = 'https://raw.githubusercontent.com/solana-labs/token-list/main/src/tokens/solana.tokenlist.json'
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url) as resp:
+                if resp.status == 200:
+                    # Read the response text and parse JSON manually
+                    text_data = await resp.text()
+                    data = json.loads(text_data)
+                    token_list = data.get('tokens', [])
+                else:
+                    token_list = []
+
+    # Search for the token in the token list
+    for token in token_list:
+        if token.get('address') == mint_address:
+            symbol = token.get('symbol', mint_address)
+            return symbol
+    # If not found, return mint address
     return mint_address
 
 async def send_keep_alive_message(bot):
-    wallet_str = str(WATCH_WALLET)
-    message = f"Keep-alive: Monitoring wallet {wallet_str}"
+    message = f"🔥 {wallet_nickname} Tracker Bot is active! 🔥"
     await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=message)
 
-async def monitor_wallet(wallet, client, bot, initial_run=False):
+async def monitor_wallet(wallet, client, bot):
     global last_signature
 
-    # Get recent transaction signatures
-    response = await client.get_signatures_for_address(wallet, limit=10)
-    if response.value is None:
-        return
-
-    signatures = response.value
-    if not signatures:
-        return
-
-    wallet_str = str(wallet)
-
-    # On initial run, process the latest 5 transactions
-    if initial_run:
-        new_signatures = [sig_info.signature for sig_info in signatures[:5]]
-    else:
-        latest_signature = signatures[0].signature
-
-        if last_signature is None:
-            last_signature = latest_signature
-            return  # Skip processing on the first regular run
-
-        # Find new signatures since the last processed one
-        new_signatures = []
-        for sig_info in signatures:
-            if sig_info.signature == last_signature:
-                break
-            new_signatures.append(sig_info.signature)
-
-        if not new_signatures:
+    try:
+        # Get recent transaction signatures
+        response = await client.get_signatures_for_address(wallet, limit=1)  # Process only the latest transaction
+        if response.value is None or not response.value:
             return
 
-    # Process new transactions
-    for sig in reversed(new_signatures):
-        txn_resp = await client.get_transaction(sig, encoding='jsonParsed')
+        signature_info = response.value[0]
+        latest_signature = signature_info.signature
+
+        # Skip processing if the latest signature has already been processed
+        if latest_signature == last_signature:
+            return
+
+        # Process the latest transaction
+        txn_resp = await client.get_transaction(latest_signature, encoding='jsonParsed')
         if txn_resp.value is None:
-            continue
+            return
 
         txn = txn_resp.value
         # Convert transaction to JSON string and then to dictionary
@@ -89,21 +91,24 @@ async def monitor_wallet(wallet, client, bot, initial_run=False):
         txn_dict = json.loads(txn_json)
         meta = txn_dict.get('meta')
         if meta is None:
-            continue
+            return
 
         pre_balances = meta.get('preTokenBalances', [])
         post_balances = meta.get('postTokenBalances', [])
 
         # Map account indices to public keys
-        account_keys = [key.get('pubkey') for key in txn_dict['transaction']['message']['accountKeys']]
+        account_keys = [key.get('pubkey') for key in txn_dict.get('transaction', {}).get('message', {}).get('accountKeys', [])]
 
         # Build balances before and after the transaction
         balances = {}
         for balance in pre_balances + post_balances:
-            idx = balance['accountIndex']
+            idx = balance.get('accountIndex')
+            if idx is None or idx >= len(account_keys):
+                continue  # Skip if index is invalid
+
             owner = balance.get('owner') or account_keys[idx]
-            mint = balance['mint']
-            amount_info = balance['uiTokenAmount']
+            mint = balance.get('mint')
+            amount_info = balance.get('uiTokenAmount')
             amount_str = amount_info.get('uiAmountString') if amount_info else None
             amount = float(amount_str) if amount_str is not None else 0
             key = (owner, mint)
@@ -112,26 +117,44 @@ async def monitor_wallet(wallet, client, bot, initial_run=False):
             else:
                 balances.setdefault(key, {})['post'] = amount
 
+        # Get transaction timestamp
+        block_time = txn_dict.get('blockTime')
+        if block_time:
+            txn_time = datetime.utcfromtimestamp(block_time).strftime('%Y-%m-%d %H:%M:%S UTC')
+        else:
+            txn_time = 'Unknown time'
+
         # Detect changes in balances
         for (owner, mint), amounts in balances.items():
             pre_amount = amounts.get('pre', 0)
             post_amount = amounts.get('post', 0)
             delta = post_amount - pre_amount
-            if delta != 0 and owner == wallet_str:
+            if delta != 0 and owner == wallet_address:
                 action = 'bought' if delta > 0 else 'sold'
-                token_name = get_token_name_from_mint(mint)
+                token_name = await get_token_name_from_mint(mint)
                 amount = abs(delta)
-                message = f"Wallet {wallet_str} {action} {amount} of {token_name}."
-                await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=message)
+                # Construct Dexscreener URL
+                dexscreener_url = f"https://dexscreener.com/solana/{mint}"
+                # Prepare the message with the requested format
+                message = (
+                    f"🔥🚀 {wallet_nickname} Tracker Bot Alert! 🚀🔥\n\n"
+                    f"{wallet_nickname} {action} {amount} of {token_name} with the contract address of:\n"
+                    f"📝 {mint} 📝\n"
+                    f"At {txn_time} 🕒\n\n"
+                    f"🔗 [View on Dexscreener]({dexscreener_url})\n"
+                    f"💰💎📈"
+                )
+                await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=message, parse_mode='Markdown')
+                break  # Only process the first relevant change
 
-    # Update the last processed signature
-    if not initial_run and signatures:
-        last_signature = signatures[0].signature
+        # Update the last processed signature
+        last_signature = latest_signature
+
+    except Exception as e:
+        print(f"Error in monitor_wallet: {e}")
+        traceback.print_exc()
 
 async def main():
-    global last_keep_alive
-    initial_run = True
-
     # Initialize Solana client and Telegram bot within the async context
     async with AsyncClient(SOLANA_RPC_URL) as client, Bot(token=TELEGRAM_BOT_TOKEN) as bot:
         # Send initial keep-alive message
@@ -139,18 +162,12 @@ async def main():
 
         while True:
             try:
-                await monitor_wallet(WATCH_WALLET, client, bot, initial_run)
-                initial_run = False
+                await monitor_wallet(WATCH_WALLET, client, bot)
             except Exception as e:
-                print(f"Error monitoring wallet {WATCH_WALLET}: {e}")
+                print(f"Error monitoring wallet: {e}")
+                traceback.print_exc()
 
-            # Check if it's time to send a keep-alive message (every hour)
-            current_time = datetime.utcnow()
-            if current_time - last_keep_alive >= timedelta(hours=1):
-                await send_keep_alive_message(bot)
-                last_keep_alive = current_time
-
-            await asyncio.sleep(60)
+            await asyncio.sleep(60)  # Check every 60 seconds
 
 if __name__ == "__main__":
     asyncio.run(main())
