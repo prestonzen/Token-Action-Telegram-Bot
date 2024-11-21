@@ -25,8 +25,11 @@ if not wallet_address:
     print("No wallet address provided in the .env file.")
     exit(1)
 
+wallet_address = wallet_address.strip()
+wallet_address_lower = wallet_address.lower()
+
 try:
-    WATCH_WALLET = Pubkey.from_string(wallet_address.strip())
+    WATCH_WALLET = Pubkey.from_string(wallet_address)
 except ValueError as e:
     print(f"Invalid wallet address: {e}")
     exit(1)
@@ -40,73 +43,101 @@ token_list = None
 async def get_token_name_from_mint(mint_address):
     global token_list
     if token_list is None:
+        print("Fetching token list...")
         # Fetch the token list
         url = 'https://raw.githubusercontent.com/solana-labs/token-list/main/src/tokens/solana.tokenlist.json'
         async with aiohttp.ClientSession() as session:
-            async with session.get(url) as resp:
-                if resp.status == 200:
-                    # Read the response text and parse JSON manually
-                    text_data = await resp.text()
-                    data = json.loads(text_data)
-                    token_list = data.get('tokens', [])
-                else:
-                    token_list = []
+            try:
+                async with session.get(url) as resp:
+                    if resp.status == 200:
+                        # Read the response text and parse JSON manually
+                        text_data = await resp.text()
+                        data = json.loads(text_data)
+                        token_list = data.get('tokens', [])
+                        print(f"Fetched {len(token_list)} tokens.")
+                    else:
+                        print(f"Failed to fetch token list. Status code: {resp.status}")
+                        token_list = []
+            except Exception as e:
+                print(f"Exception while fetching token list: {e}")
+                token_list = []
 
     # Search for the token in the token list
     for token in token_list:
         if token.get('address') == mint_address:
             symbol = token.get('symbol', mint_address)
+            print(f"Found token symbol '{symbol}' for mint address {mint_address}.")
             return symbol
     # If not found, return mint address
+    print(f"Token symbol not found for mint address {mint_address}. Using mint address as token name.")
     return mint_address
 
 async def send_keep_alive_message(bot):
     message = f"🔥 {wallet_nickname} Tracker Bot is active! 🔥"
     await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=message)
+    print("Sent keep-alive message.")
 
 async def monitor_wallet(wallet, client, bot):
     global last_signature
 
     try:
+        print("Fetching recent transaction signatures...")
         # Get recent transaction signatures
-        response = await client.get_signatures_for_address(wallet, limit=1)  # Process only the latest transaction
+        response = await client.get_signatures_for_address(wallet, limit=1)
         if response.value is None or not response.value:
+            print("No transaction signatures found.")
             return
 
         signature_info = response.value[0]
         latest_signature = signature_info.signature
+        print(f"Latest signature: {latest_signature}")
 
         # Skip processing if the latest signature has already been processed
         if latest_signature == last_signature:
+            print("No new transactions to process.")
             return
 
+        print(f"Processing transaction {latest_signature} for wallet {wallet_address}")
+
         # Process the latest transaction
-        txn_resp = await client.get_transaction(latest_signature, encoding='jsonParsed')
+        txn_resp = await client.get_transaction(
+            latest_signature,
+            encoding='jsonParsed',
+            max_supported_transaction_version=0
+        )
         if txn_resp.value is None:
+            print("Transaction details not found.")
             return
 
         txn = txn_resp.value
-        # Convert transaction to JSON string and then to dictionary
         txn_json = txn.to_json()
         txn_dict = json.loads(txn_json)
         meta = txn_dict.get('meta')
         if meta is None:
+            print("Transaction metadata not found.")
             return
 
         pre_balances = meta.get('preTokenBalances', [])
         post_balances = meta.get('postTokenBalances', [])
+        print(f"Pre-token balances: {pre_balances}")
+        print(f"Post-token balances: {post_balances}")
 
         # Map account indices to public keys
         account_keys = [key.get('pubkey') for key in txn_dict.get('transaction', {}).get('message', {}).get('accountKeys', [])]
+        print(f"Account keys: {account_keys}")
 
-        # Build balances before and after the transaction
         balances = {}
         for balance in pre_balances + post_balances:
             idx = balance.get('accountIndex')
             if idx is None or idx >= len(account_keys):
+                print(f"Invalid account index {idx}. Skipping balance entry.")
                 continue  # Skip if index is invalid
 
-            owner = balance.get('owner') or account_keys[idx]
+            owner = balance.get('owner')
+            if owner is None:
+                owner = account_keys[idx]
+
+            owner = str(owner).strip().lower()
             mint = balance.get('mint')
             amount_info = balance.get('uiTokenAmount')
             amount_str = amount_info.get('uiAmountString') if amount_info else None
@@ -117,25 +148,29 @@ async def monitor_wallet(wallet, client, bot):
             else:
                 balances.setdefault(key, {})['post'] = amount
 
+            print(f"Processed balance entry: Owner={owner}, Mint={mint}, Amount={amount}")
+
         # Get transaction timestamp
         block_time = txn_dict.get('blockTime')
         if block_time:
             txn_time = datetime.utcfromtimestamp(block_time).strftime('%Y-%m-%d %H:%M:%S UTC')
         else:
             txn_time = 'Unknown time'
+        print(f"Transaction time: {txn_time}")
 
         # Detect changes in balances
         for (owner, mint), amounts in balances.items():
             pre_amount = amounts.get('pre', 0)
             post_amount = amounts.get('post', 0)
             delta = post_amount - pre_amount
-            if delta != 0 and owner == wallet_address:
+
+            print(f"Owner: {owner}, Mint: {mint}, Pre-Amount: {pre_amount}, Post-Amount: {post_amount}, Delta: {delta}")
+
+            if delta != 0 and owner == wallet_address_lower:
                 action = 'bought' if delta > 0 else 'sold'
                 token_name = await get_token_name_from_mint(mint)
                 amount = abs(delta)
-                # Construct Dexscreener URL
                 dexscreener_url = f"https://dexscreener.com/solana/{mint}"
-                # Prepare the message with the requested format
                 message = (
                     f"🔥🚀 {wallet_nickname} Tracker Bot Alert! 🚀🔥\n\n"
                     f"{wallet_nickname} {action} {amount} of {token_name} with the contract address of:\n"
@@ -145,16 +180,22 @@ async def monitor_wallet(wallet, client, bot):
                     f"💰💎📈"
                 )
                 await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=message, parse_mode='Markdown')
+                print("Sent transaction alert message.")
                 break  # Only process the first relevant change
+            else:
+                print(f"Owner {owner} does not match the monitored wallet {wallet_address_lower} or delta is zero.")
 
         # Update the last processed signature
         last_signature = latest_signature
+        print(f"Updated last_signature to {last_signature}")
 
     except Exception as e:
         print(f"Error in monitor_wallet: {e}")
         traceback.print_exc()
 
 async def main():
+    print("Starting wallet trade alert bot...")
+    print(f"Monitoring wallet: {wallet_address} ({wallet_nickname})")
     # Initialize Solana client and Telegram bot within the async context
     async with AsyncClient(SOLANA_RPC_URL) as client, Bot(token=TELEGRAM_BOT_TOKEN) as bot:
         # Send initial keep-alive message
